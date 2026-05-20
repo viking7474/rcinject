@@ -15,6 +15,10 @@
 #include <set>
 #include <sys/user.h>
 #include <unistd.h>
+#include <android/dlext.h>
+
+extern char embed[];
+extern size_t embed_size;
 
 Result<Void> inject_init(const std::string& rc_content, std::string_view inject_lib_path, int pid = 1, bool do_in_child = false) {
     if (ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_TRACESYSGOOD) < 0) {
@@ -46,6 +50,52 @@ Result<Void> inject_init(const std::string& rc_content, std::string_view inject_
     run_finally restore_si{[&]() {
         if (auto res = si.restore(); res.is_err()) {
             LOGE("failed to restore: {}", res.get_error().display());
+        }
+    }};
+    struct user_regs_struct regs{}, backup{};
+    int remote_lib_fd;
+    TRY(get_regs(pid, regs));
+    {
+        auto remote_lib_name = TRY(push_string(pid, regs, "injectrclib"));
+        remote_lib_fd = TRY(si.do_syscall(__NR_memfd_create, remote_lib_name, MFD_CLOEXEC));
+        if (remote_lib_fd < 0) {
+            LOGE("failed to create remote lib fd: errno={}", remote_lib_fd);
+            return Err(ERRNO_ERROR, remote_lib_fd, "create remote lib fd");
+        }
+        LOGD("remote lib fd {}", remote_lib_fd);
+        auto f = xopen_file(Format("/proc/{}/fd/{}", pid, remote_lib_fd).c_str(), "w");
+        if (!f) {
+            return Errno("open remote lib fd");
+        } else {
+            if (inject_lib_path.empty()) {
+                if (fwrite(embed, embed_size, 1, f.get()) != 1) {
+                    return Err("not fully dumped lib");
+                }
+            } else {
+                auto libf = xopen_file(inject_lib_path.data(), "r");
+                if (!libf) {
+                    return Errno(Format("open {}", inject_lib_path));
+                } else {
+                    std::string content;
+                    char fbuf[4096];
+                    for (;;) {
+                        auto r = fread(fbuf, 1, sizeof(fbuf), libf.get());
+                        if (!r) break;
+                        content.append(fbuf, r);
+                    }
+                    if (fwrite(content.data(), content.size(), 1, f.get()) != 1) {
+                        return Err("not fully dumped lib");
+                    }
+                }
+            }
+        }
+    }
+    run_finally close_lib_fd{[&]() {
+        auto close_res = si.do_syscall(__NR_close, remote_lib_fd);
+        if (close_res.is_ok()) {
+            LOGD("close lib fd result: {}", close_res.get_value());
+        } else {
+            LOGE("close lib fd failed : {}", close_res.get_error().display());
         }
     }};
     if (do_in_child) {
@@ -87,8 +137,6 @@ Result<Void> inject_init(const std::string& rc_content, std::string_view inject_
         }
     }};
 
-
-    struct user_regs_struct regs{}, backup{};
     TRY(get_regs(pid, regs));
     memcpy(&backup, &regs, sizeof(regs));
 
@@ -122,14 +170,26 @@ Result<Void> inject_init(const std::string& rc_content, std::string_view inject_
         return Err("init elf");
     }
 
-    auto dlopen_addr = (uintptr_t) libdl.getSymbAddress("dlopen");
+    auto dlopen_addr = (uintptr_t) libdl.getSymbAddress("android_dlopen_ext");
     auto dlclose_addr = (uintptr_t) libdl.getSymbAddress("dlclose");
     auto dlsym_addr = (uintptr_t) libdl.getSymbAddress("dlsym");
 
-    set_system_con(inject_lib_path);
-    auto lib_path = TRY(push_string(pid, regs, inject_lib_path));
+    std::string real_lib_path{};
+    if (inject_lib_path.empty()) {
+        real_lib_path = Format("/proc/{}/fd/{}", pid, remote_lib_fd);
+    } else {
+        real_lib_path = inject_lib_path;
+    }
+    set_system_con(real_lib_path);
+    auto lib_path = TRY(push_string(pid, regs, real_lib_path));
 
-    uintptr_t args[] = {lib_path, RTLD_NOW};
+    android_dlextinfo info{};
+    info.flags = ANDROID_DLEXT_USE_LIBRARY_FD | ANDROID_DLEXT_FORCE_LOAD;
+    info.library_fd = remote_lib_fd;
+
+    auto remote_info = TRY(push_memory(pid, regs, &info, sizeof(info)));
+
+    uintptr_t args[] = {lib_path, RTLD_NOW, remote_info};
 
     auto calldlerr = [&]() -> Result<Void> {
         auto dlerror_addr = (uintptr_t) libdl.getSymbAddress("dlerror");
@@ -140,7 +200,7 @@ Result<Void> inject_init(const std::string& rc_content, std::string_view inject_
         return Ok();
     };
 
-    auto handle = TRY(remote_call(pid, regs, dlopen_addr, 0, args, 2).context("dlopen"));
+    auto handle = TRY(remote_call(pid, regs, dlopen_addr, 0, args, 3).context("dlopen"));
     if (handle == 0) {
         if (auto res = calldlerr(); res.is_err()) {
             LOGE("calldlerr err: {}", res.get_error().display());
@@ -280,7 +340,7 @@ int main(int argc, char **argv) {
     logging::setPrintEnabled(true);
     int pid = 1;
     bool do_in_fork = false;
-    std::string rc_file, lib_path = "/data/local/tmp/libinjectrclib.so";
+    std::string rc_file, lib_path = "";
     if (argc >= 2) {
         for (int i = 1; i < argc; i++) {
             std::string_view a{argv[i]};
@@ -303,6 +363,18 @@ int main(int argc, char **argv) {
                     pid = strtoul(argv[++i], nullptr, 0);
                 } else if (a == "--lib") {
                     lib_path = argv[++i];
+                } else if (a == "-d") {
+                    auto dump_path = argv[++i];
+                    LOGI("dump lib to {}", dump_path);
+                    auto f = xopen_file(dump_path, "w");
+                    if (!f) {
+                        return 1;
+                    } else {
+                        if (fwrite(embed, embed_size, 1, f.get()) != 1) {
+                            LOGE("not fully dumped");
+                        }
+                    }
+                    return 0;
                 }
             } else if (a == "--fork") {
                 do_in_fork = true;

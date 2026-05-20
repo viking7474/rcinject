@@ -88,7 +88,7 @@ def config(abi, plat, build_type="Debug"):
             f'-DCMAKE_TOOLCHAIN_FILE={CMAKE_TOOLCHAIN_FILE}',
             f'-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={output_dir}',
             f'-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={output_dir}',
-            f'-DDEBUG_SYMBOLS_PATH={unstripped_output_dir}',
+            #f'-DDEBUG_SYMBOLS_PATH={unstripped_output_dir}',
             f"-DCMAKE_BUILD_TYPE={build_type}",
             '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
             '-G', 'Ninja'
