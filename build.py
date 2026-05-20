@@ -9,7 +9,7 @@ from argparse import ArgumentParser
 
 
 def initialize():
-    global ANDROID_HOME, ANDROID_NDK_HOME, PLATFORM, CMAKE_TOOLCHAIN_FILE, BUILD_DIR, OUTPUT_DIR, UNSTRIPPED_OUTPUT_DIR
+    global ANDROID_HOME, ANDROID_NDK_HOME, PLATFORM, CMAKE_TOOLCHAIN_FILE, BUILD_DIR, OUTPUT_DIR
     ANDROID_HOME = os.getenv('ANDROID_HOME')
     if ANDROID_HOME is None:
         ANDROID_HOME = os.getenv('ANDROID_SDK_ROOT')
@@ -34,7 +34,6 @@ def initialize():
     CMAKE_TOOLCHAIN_FILE = ANDROID_NDK_HOME / 'build/cmake/android.toolchain.cmake'
     BUILD_DIR = Path("./my_build").absolute()
     OUTPUT_DIR = Path("./output").absolute()
-    UNSTRIPPED_OUTPUT_DIR = (OUTPUT_DIR / "unstripped").absolute()
 
 
 initialize()
@@ -76,7 +75,6 @@ def exec_adb_shell(c, device=None, root=False):
 def config(abi, plat, build_type="Debug"):
     build_dir = BUILD_DIR / build_type / abi
     output_dir = OUTPUT_DIR / build_type / abi
-    unstripped_output_dir = UNSTRIPPED_OUTPUT_DIR / build_type / abi
     exec_cmd(
         [
             'cmake',
@@ -88,7 +86,6 @@ def config(abi, plat, build_type="Debug"):
             f'-DCMAKE_TOOLCHAIN_FILE={CMAKE_TOOLCHAIN_FILE}',
             f'-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={output_dir}',
             f'-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={output_dir}',
-            #f'-DDEBUG_SYMBOLS_PATH={unstripped_output_dir}',
             f"-DCMAKE_BUILD_TYPE={build_type}",
             '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
             '-G', 'Ninja'
