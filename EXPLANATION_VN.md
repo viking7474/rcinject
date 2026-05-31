@@ -106,3 +106,44 @@ $MODDIR/system/bin/injectrc
 ```
 
 Sau khi máy khởi động lại và module Magisk/KernelSU được nạp, cấu hình ẩn của bạn sẽ tự động được tiêm thẳng vào quá trình hệ thống đang chạy.
+
+## 5. Khả năng can thiệp Zygote / System_server để thay thế thư viện (.so)
+
+**Câu hỏi:** *Cơ chế này có dùng được khi `system_server` hoặc `zygote` dùng `System.loadLibrary` để load một file `.so` không? Có thể thay thế file `.so` đó bằng file khác không?*
+
+**Trả lời:** **Về mặt kỹ thuật cốt lõi là CÓ, nhưng bạn cần phải tự viết lại phần Payload.**
+
+* **Cơ chế Injector dùng chung được:** Quá trình đính kèm (`ptrace`), tạo file ẩn (`memfd_create`), và ép tiến trình đích gọi `dlopen` (những gì `init_injector/injector.cpp` làm) là một kỹ thuật tiêm mã (code injection) dùng chung. Công cụ này hoàn toàn có thể nhắm mục tiêu vào PID của `zygote` hoặc `system_server` (thay vì PID 1 của `init`).
+* **Tại sao cần viết lại Payload:** File `payload.cpp` hiện tại được viết *chỉ dành riêng* cho cấu trúc nội bộ của tiến trình `init` (tìm các hàm `ActionManager`, `ServiceList`). Nếu bạn tiêm nó vào `zygote`, nó sẽ lỗi vì `zygote` không chứa các hàm đó.
+* **Giải pháp thay thế `.so` thực tế:**
+  1. Bạn giữ nguyên `injector.cpp`.
+  2. Bạn viết một `payload.cpp` mới chứa mã nhúng Hooking (ví dụ sử dụng thư viện Dobby, xhook, hoặc riru/zygisk core code).
+  3. Khi tiêm payload mới này vào `zygote`/`system_server`, payload sẽ thực hiện **Hook hàm `dlopen` (hoặc `android_dlopen_ext`)** hoặc các hàm JNI liên quan.
+  4. Mỗi khi Java gọi `System.loadLibrary("libA.so")`, hàm hook của bạn trên RAM sẽ can thiệp và ép hệ thống chuyển hướng tải file `libB.so` (file bạn muốn thay thế) thay cho `libA.so`.
+
+## 6. Vô hiệu hóa script (.rc) của hệ thống mà không cần sửa đổi file
+
+**Câu hỏi:** *Có một script rc nằm ở `/system`, tôi không muốn xoá/edit file vật lý nhưng muốn vô hiệu hóa nó, mã này có phương án không?*
+
+**Trả lời:** **CÓ THỂ, thông qua việc thao tác trực tiếp trên bộ nhớ (RAM) bằng C++ trong `payload.cpp`.**
+
+Khi Android khởi động, tiến trình `init` đọc tất cả các file `.rc` ở `/system` và nạp vào bộ nhớ RAM. Các thông tin này được lưu giữ dưới dạng các đối tượng C++ trong 2 danh sách chính quản lý bởi `init`:
+* `ActionManager`: Chứa các hành động (như `on property:...`)
+* `ServiceList`: Chứa các dịch vụ (như `service ...`)
+
+Nhìn vào `payload.cpp`, mã nguồn này **đã lấy được quyền truy cập trực tiếp (con trỏ tham chiếu)** vào 2 danh sách này trên RAM:
+```cpp
+FIND_SYM(ServiceList::GetInstance_fn, kServiceListGetInstance)
+FIND_SYM(ActionManager::GetInstance_fn, kActionManagerGetInstance)
+
+auto& action_manager = ActionManager::GetInstance_fn();
+auto& service_list = ServiceList::GetInstance_fn();
+```
+
+**Phương án vô hiệu hóa (Không chạm vào file):**
+Thay vì dùng mã này để thêm (Inject) cấu hình mới bằng `ParseConfig`, bạn có thể sửa trực tiếp mã C++ của `payload.cpp` trong hàm `Entry()` để **xóa hoặc vô hiệu hóa cấu hình đang có sẵn trên RAM**:
+
+1. **Với Service:** Bạn có thể lặp (loop) qua `service_list`, lấy tên của từng service. Nếu tên trùng với service nằm trong tệp `/system` mà bạn muốn tắt, bạn thay đổi các thuộc tính trạng thái (flags) của nó thành vô hiệu hóa (disabled), hoặc gọi hàm nội bộ để gỡ nó khỏi danh sách. Vì `init` quản lý service trên RAM, khi xóa khỏi RAM, service đó coi như "chết" mặc dù file chữ trên `/system/etc/init/` vẫn còn nguyên.
+2. **Với Action/Trigger:** Bạn có thể lặp qua `action_manager`, tìm chuỗi trigger mà bạn không mong muốn, rồi xóa bỏ danh sách các lệnh (commands) bên trong action đó.
+
+*Tóm lại, InjectRC là "chìa khóa" đưa code C++ của bạn vào giữa "đầu não" `init`. Một khi đã vào được (như file `payload.cpp`), bạn có toàn quyền thao tác với các biến quản lý service/action của Android trên RAM mà không cần động đến bất kỳ file vật lý nào.*
