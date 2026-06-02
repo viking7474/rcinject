@@ -147,3 +147,54 @@ Thay vì dùng mã này để thêm (Inject) cấu hình mới bằng `ParseConf
 2. **Với Action/Trigger:** Bạn có thể lặp qua `action_manager`, tìm chuỗi trigger mà bạn không mong muốn, rồi xóa bỏ danh sách các lệnh (commands) bên trong action đó.
 
 *Tóm lại, InjectRC là "chìa khóa" đưa code C++ của bạn vào giữa "đầu não" `init`. Một khi đã vào được (như file `payload.cpp`), bạn có toàn quyền thao tác với các biến quản lý service/action của Android trên RAM mà không cần động đến bất kỳ file vật lý nào.*
+
+## 7. Thay thế một hàm của một file `.so` ngay trong giai đoạn init
+
+**Câu hỏi:** *Dựa vào mã này có thể inject để thay thế 1 hàm của 1 file `.so` ở giai đoạn `init` hay không?*
+
+**Trả lời:** **CÓ, hoàn toàn có thể.**
+
+Mã nguồn `InjectRC` hiện tại đã bao gồm **90%** những thành phần cốt lõi mạnh mẽ nhất cần thiết để thực hiện việc thay thế (hooking) một hàm của bất kỳ file `.so` nào đang được nạp bởi tiến trình `init` (hoặc bất kỳ tiến trình nào khác).
+
+**Tại sao nó làm được?**
+Hãy nhìn vào các thư viện đi kèm trong mã nguồn:
+1. `injector.cpp` (ptrace, memfd, dlopen): Đã giải quyết được bài toán khó nhất là làm sao "bơm" (inject) code C++ của bạn vào một tiến trình đang chạy (kể cả `init` với đặc quyền cao nhất) mà không làm sập nó.
+2. `maps_scan`: Thư viện này cho phép duyệt `/proc/PID/maps` để tìm chính xác địa chỉ cơ sở (base address) mà file `.so` mục tiêu đang được nạp trên RAM.
+3. `elf_parser`: Thư viện này phân tích bảng symbol (bảng tên hàm) của file thực thi hoặc file `.so`, giúp bạn dịch từ tên hàm (ví dụ: `my_target_function`) ra một địa chỉ bộ nhớ tuyệt đối.
+
+*(Thực tế, `payload.cpp` đang dùng chính 3 thứ trên để tìm và gọi hàm `ParseConfig` của `init`. Việc thay thế hàm cũng làm y hệt vậy).*
+
+**Cách triển khai (Những gì bạn cần code thêm):**
+
+Nếu bạn muốn thay thế hàm `check_security()` của file `libcrypto.so` bên trong `init`:
+
+**Bước 1: Viết hàm thay thế trong `payload.cpp`**
+```cpp
+// Đây là hàm giả mạo của bạn
+int my_fake_check_security() {
+    LOGI("Hacked security check!");
+    return 1; // Luôn trả về pass
+}
+```
+
+**Bước 2: Tìm địa chỉ hàm gốc**
+Sử dụng `maps_scan` và `elf_parser` (như cách `Entry()` đang làm) để tìm địa chỉ của `check_security` trong RAM:
+```cpp
+// ... (code maps_scan tìm base address của libcrypto.so) ...
+// ... (code elf_parser tìm offset của check_security) ...
+void* target_func_addr = (void*) elf.getSymbAddress("check_security");
+```
+
+**Bước 3: Thực hiện thay thế (Inline Hooking)**
+Đây là bước duy nhất mà `InjectRC` chưa có sẵn. Để thay thế hàm tại địa chỉ `target_func_addr` bằng `my_fake_check_security`, bạn cần tích hợp thêm một thư viện Inline Hooking nhẹ (phổ biến nhất trên Android C/C++ là **Dobby** hoặc **xhook**).
+
+Chỉ cần gọi hàm hook của thư viện đó ngay trong `Entry()` của `payload.cpp`:
+```cpp
+#include <dobby.h>
+
+// Hook hàm
+DobbyHook(target_func_addr, (void*)my_fake_check_security, (void**)&original_check_security);
+```
+
+**Kết luận:**
+Bạn dùng `injector` để bắn `payload.so` vào `init`. Khi `payload.so` được kích hoạt, nó tự tìm hàm mục tiêu bằng `elf_parser` và dùng `Dobby` đè mã máy (machine code) của hàm gốc để ép nó chạy sang hàm C++ giả mạo của bạn. Tất cả diễn ra trên RAM (On-the-fly) ngay trong lúc `init` đang chạy.
