@@ -198,3 +198,38 @@ DobbyHook(target_func_addr, (void*)my_fake_check_security, (void**)&original_che
 
 **Kết luận:**
 Bạn dùng `injector` để bắn `payload.so` vào `init`. Khi `payload.so` được kích hoạt, nó tự tìm hàm mục tiêu bằng `elf_parser` và dùng `Dobby` đè mã máy (machine code) của hàm gốc để ép nó chạy sang hàm C++ giả mạo của bạn. Tất cả diễn ra trên RAM (On-the-fly) ngay trong lúc `init` đang chạy.
+
+## 8. Khả năng thay thế Zygisk để hook Zygote
+
+**Câu hỏi:** *Mã này có thể thay thế các chức năng của Zygisk để hook Zygote hay không?*
+
+**Trả lời:** **Về lý thuyết nền tảng là CÓ (dùng làm công cụ chèn mã), nhưng trong thực tế thì KHÔNG THỂ THAY THẾ HOÀN TOÀN trừ khi bạn tự viết thêm một lượng code khổng lồ.**
+
+Để hiểu rõ, chúng ta cần phân biệt giữa một **"Công cụ tiêm mã" (Injector - như mã nguồn này)** và một **"Bộ khung tích hợp" (Framework - như Zygisk)**.
+
+**Điểm tương đồng (Nơi InjectRC có thể thay thế Zygisk):**
+Bước đầu tiên của Zygisk là làm sao để đưa được mã của nó vào trong tiến trình `zygote` khi máy vừa khởi động. Mã nguồn `injector.cpp` của bạn (dùng `ptrace`, `memfd`, `dlopen`) hoàn toàn thực hiện xuất sắc nhiệm vụ này. Nó đủ sức đẩy một file `.so` của bạn vào `zygote`.
+
+**Tại sao InjectRC KHÔNG THỂ thay thế Zygisk ngay lập tức?**
+
+Nếu bạn chỉ dùng mã này tiêm một file `.so` vào `zygote`, bạn sẽ thiếu những tính năng cực kỳ quan trọng mà Zygisk đã mất nhiều năm để hoàn thiện:
+
+1. **Quản lý vòng đời App (App Specialize Hooking):**
+   * Zygote là tiến trình mẹ. Khi bạn mở một ứng dụng (ví dụ: Facebook), Zygote sẽ nhân bản (fork) chính nó ra để tạo thành Facebook.
+   * **Zygisk** hook sâu vào các hàm `nativePreAppSpecialize` và `nativePostAppSpecialize` của Zygote. Nhờ đó, Zygisk biết chính xác lúc nào App được sinh ra, tên gói (package name) là gì, để quyết định có load module của bạn vào App đó hay không.
+   * **InjectRC** chỉ thả cục payload của bạn vào Zygote. Để theo dõi App mở lên, payload của bạn sẽ phải tự tìm và tự hook các hàm `fork` này.
+
+2. **Vượt rào SELinux (SELinux Bypass/Context):**
+   * Khi Zygote fork thành App, quyền hạn của nó bị giảm xuống (chuyển sang untrusted_app context) và bị SELinux kiểm soát gắt gao.
+   * Nếu payload của bạn (tiêm bằng InjectRC) cố gắng mở một file trong `/data/local/tmp` hoặc thực thi code trái phép sau khi fork, App sẽ crash ngay lập tức do bị SELinux chặn (avc denied).
+   * **Zygisk** tự động cung cấp bộ API để lấy file descriptor an toàn và dọn dẹp các quy tắc SELinux tinh vi để module chạy mượt mà.
+
+3. **Cơ chế ẩn mình (Hide/Denylist/Unmount):**
+   * **Zygisk** tự động gỡ (unmount) các dấu vết của nó và module khỏi các không gian tên (mount namespace) của các ứng dụng ngân hàng, game để chống phát hiện (anti-cheat).
+   * Dùng InjectRC, thư viện `.so` của bạn sẽ nằm tơ hơ trong `/proc/PID/maps` của App, và sẽ bị app ngân hàng phát hiện ngay lập tức.
+
+4. **Hệ sinh thái API:**
+   * Zygisk định nghĩa một bộ `api.h` chuẩn mực. Hàng ngàn lập trình viên chỉ việc viết `RegisterModule` là xong. Với InjectRC, bạn phải tự thao tác thủ công từng con trỏ bộ nhớ một.
+
+**Tóm lại:**
+Mã nguồn `InjectRC` giống như **"một mũi kim tiêm"**, còn **Zygisk** là **"cả một hệ thống y tế"**. Bạn hoàn toàn có thể dùng `InjectRC` làm công cụ nền tảng (bước đầu tiên) để chui vào `Zygote`. Nhưng sau khi chui vào xong, file `payload.cpp` của bạn sẽ phải gánh vác việc tự viết lại logic hook `fork()`, tự xử lý SELinux, và tự xóa dấu vết – những thứ mà Zygisk đã làm sẵn cho bạn.
